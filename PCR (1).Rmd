@@ -1,0 +1,443 @@
+---
+title: "Principal Component Regression"
+author: "Sriya Cheedella, Mia Shu"
+date: "12/2/2019"
+output: 
+  beamer_presentation:
+    theme: "Luebeck"
+    colortheme: "dolphin"
+    fonttheme: "structurebold"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+```{r, libs, include=FALSE}
+#library(car)
+library(pls)
+library(GGally)
+#library(corrplot)
+library(dplyr)
+#library(ggbiplot)
+#library(devtools)
+set.seed (1000)
+```
+
+```{r cleandata, include=FALSE}
+circuits <- read.csv("~/Documents/temp/cmda4654/formula-1-race-data-19502017/circuits.csv")
+cons <- read.csv("~/Documents/temp/cmda4654/formula-1-race-data-19502017/constructors.csv")
+constand <- read.csv("~/Documents/temp/cmda4654/formula-1-race-data-19502017/constructorStandings.csv")
+drivers <- read.csv("~/Documents/temp/cmda4654/formula-1-race-data-19502017/drivers.csv")
+drivstand <- read.csv("~/Documents/temp/cmda4654/formula-1-race-data-19502017/driverStandings.csv")
+pitstops <- read.csv("~/Documents/temp/cmda4654/formula-1-race-data-19502017/pitStops.csv")
+races <- read.csv("~/Documents/temp/cmda4654/formula-1-race-data-19502017/races.csv")
+results <- read.csv("~/Documents/temp/cmda4654/formula-1-race-data-19502017/results.csv")
+#useless
+seasons <- read.csv("~/Documents/temp/cmda4654/formula-1-race-data-19502017/seasons.csv")
+status <- read.csv("~/Documents/temp/cmda4654/formula-1-race-data-19502017/status.csv")
+conres <- read.csv("~/Documents/temp/cmda4654/formula-1-race-data-19502017/constructorResults.csv")
+qual <-  read.csv("~/Documents/temp/cmda4654/formula-1-race-data-19502017/qualifying.csv")
+laptimes <- read.csv("~/Documents/temp/cmda4654/formula-1-race-data-19502017/lapTimes.csv")
+
+diffraces <- as.vector(unique(results$raceId))
+tot <- data.frame(Totals=double())
+for (i in 1:length(diffraces)) {
+  tot = rbind(tot, nrow(subset(results, raceId == diffraces[i])))
+}
+combo <- cbind(diffraces,tot)
+ord <- order(combo$X22L, decreasing = TRUE)
+deccombo <- combo[ord,]
+deccombo <- deccombo[which(deccombo$diffraces > 840),] #pitstop data is only for races > 840
+#chose 870 because top 30ish all have 24 points
+raceid <- as.integer(deccombo$diffraces[30]) #raceID: 870
+racenamerow <- races[races$raceId == raceid,]
+racename <- as.character(racenamerow$name) #Race Name: Hungarian Grand Prix
+hungcircid <- racenamerow$circuitId #Circuit ID: 11
+
+#pit stops
+hungpitstops <- pitstops[which(pitstops$raceId == raceid),]
+
+#constructors
+hungconres <- conres[which(conres$raceId == raceid),]
+hungconstand <- constand[which(constand$raceId == raceid),]
+hungconstand <- hungconstand[,c(3,4)]
+colnames(hungconstand) <- c("constructorId", "conPoints")
+tempcon <- merge(cons, hungconres, by = "constructorId")
+hungcons <- merge(tempcon, hungconstand, by = "constructorId")
+hungcons <- hungcons[,c(1,2)]
+
+#drivers
+hungdrivstand <- drivstand[which(drivstand$raceId == raceid),]
+hungdrivstand <- hungdrivstand[,c(3,4)]
+colnames(hungdrivstand) <- c("driverId", "drivPoints")
+hunglaptimes <- laptimes[which(laptimes$raceId == raceid),]
+driverid <- data.frame(as.vector(hunglaptimes$driverId))
+colnames(driverid) <- "driverId"
+hungdrivers <- merge(drivers, driverid, by = "driverId")
+hungdrivers <- unique(hungdrivers[,c(1,2)])
+
+#results
+hungres <- results[which(results$raceId == raceid),]
+hungres <- subset(hungres, select = -c(number, grid, position, 
+                                       positionText, positionOrder, points, fastestLap, rank, 
+                                       fastestLapTime, fastestLapSpeed, time))
+
+#filling in missing result race times
+for (i in 15:24) {
+  resdrivid <- hungres[i,]$driverId
+  resalldriv <- hunglaptimes[which(hunglaptimes$driverId == resdrivid),]
+  restime <- sum(resalldriv$milliseconds)
+  hungres[i, 6] <- restime
+}
+
+#hungres is base dataset, everything is added onto that
+
+#adding pitstops to hungres
+#find rows for each driver, max pit stop #, store in respective race id row plus time
+psinfo <- data.frame(DriverID=double(), NumOfPS=double(), Milliseconds=double())
+for (i in 1:nrow(hungres)) {
+  resdrivid <- hungres[i,]$driverId
+  drivpitstops <- hungpitstops[which(hungpitstops$driverId == resdrivid),]
+  psnum <- max(drivpitstops$stop)
+  pstime <- sum(drivpitstops$milliseconds)
+  psdrivinfo <- cbind(resdrivid, psnum, pstime)
+  psinfo <- rbind(psinfo, psdrivinfo)
+}
+colnames(psinfo) <- c("driverId", "pitStops", "MillisecondsPS")
+hungres <- merge(hungres, psinfo, by = "driverId")
+
+#replace driverid with names
+hungres <- merge(hungres, hungdrivers, by = "driverId")
+
+#replace constructorId with names
+hungres <- merge(hungres, hungcons, by = "constructorId")
+
+#constructor standings
+hungres <- merge(hungres, hungconstand, by = "constructorId")
+
+#driver standings
+hungres <- merge(hungres, hungdrivstand, by = "driverId")
+
+#clean up hungres
+hungres <- hungres %>% select(driverRef, constructorRef, milliseconds, everything())
+hungres <- subset(hungres, select = -c(4,5,6,7,9))
+```
+
+## Introduction
+- Motivation
+
+  When we have more than two covariates, multicollinearity impacts our model construction, parameter estimation, and prediction. In order to reduce its impact on our model, we reduce multicollinearity among variables by fitting the Principal Components.
+
+- Methodology
+
+  Break the collinear parts into uncorrelated smaller parts
+
+
+## Definitions
+
+- Multicollinearity
+
+Multicollinearity exists among the predictor variables when these variables are correlated among themselves.
+
+Example: weight and height; education level and salary
+
+- Confounding
+
+The result of multicollinearity is often  termed confounding: the situation when the correlation between two variables  is aberrant due to  a third variable included in the analysis.
+
+## Regression Model
+
+Simple linear regression
+
+  $Y_i = \beta_0 + \beta_1 X_i + \varepsilon_i$
+
+  $Y_i$ Response at $i$th trial
+
+  $\beta_0,\beta_1$ Regression coefficients
+
+  $X_i$ Predictors  at $i$th trial 
+
+  $\varepsilon_i\stackrel{iid}{\sim} \mathcal{N}(0,\sigma^2)$ Random error 
+
+## Matrix Representation
+
+Model $Y = X\beta + \varepsilon$
+
+Residual $e_i = Y_i - \hat{Y_i} = Y - Xb$
+
+$b$ is the estimated vector of $\beta$
+
+$\left[\begin{array}{c}{Y_{1}} \\ {Y_{2}} \\ {\vdots} \\ {Y_{n}}\end{array}\right]=\left[\begin{array}{cc}{1} & {X_{1}} \\ {1} & {X_{2}} \\ {\vdots} & {\vdots} \\ {1} & {X_{n}}\end{array}\right]\left[\begin{array}{c}{\beta_{0}} \\ {\beta_{1}}\end{array}\right]+\left[\begin{array}{c}{\varepsilon_{1}} \\ {\varepsilon_{2}} \\ {\vdots} \\ {\varepsilon_{n}}\end{array}\right]$
+
+## Multiple Linear Regression
+
+Model
+
+$Y_i = \beta_0 + \beta_1 X_{i1} + \beta_2 X_{i2} + \dots + \beta_p X_{ip} + \varepsilon_i$
+
+$\left[\begin{array}{c}{Y_{1}} \\ {Y_{2}} \\ {\vdots} \\ {Y_{n}}\end{array}\right]=\left[\begin{array}{ccccc}{1} & {X_{11}} & {X_{12}} & {\cdots} & {X_{1 p}} \\ {1} & {X_{21}} & {X_{22}} & {\cdots} & {X_{2 p}} \\ {\vdots} & {\vdots} & {\vdots} & {\vdots} & {\vdots} \\ {1} & {X_{n 1}} & {X_{n 2}} & {\cdots} & {X_{n p}}\end{array}\right]\left[\begin{array}{c}{\beta_{0}} \\ {\beta_{1}} \\ {\vdots} \\ {\beta_{p}}\end{array}\right]+\left[\begin{array}{c}{\varepsilon_{1}} \\ {\varepsilon_{2}} \\ {\vdots} \\ {\varepsilon_{n}}\end{array}\right]$
+
+## Diagnostic for Multicollinearity
+
+- ggpairs(X)& cor(X)
+
+     Look for high pairwise correlation
+- vif(X)
+
+   5-10 moderately high
+   
+   $<$ 10 extremely high
+
+## The Least Squares Estimator
+
+$\begin{array}{|cc|}\hline \mathbf{y} & {\frac{\partial \mathbf{y}}{\partial \mathbf{x}}} \\ \hline \mathbf{A x} & {\mathbf{A}^{T}} \\ {\mathbf{x}^{T} \mathbf{A}} & {\mathbf{A}} \\ {\mathbf{x}^{T} \mathbf{x}}  & {2 \mathbf{x}} \\ {\mathbf{x}^{T} \mathbf{A} \mathbf{x}} & {\mathbf{A} \mathbf{x}+\mathbf{A}^{T} \mathbf{x}}\\ \hline\end{array}$
+
+$\begin{aligned} R S S(b) &=\sum e_{i}^{2}=e^{\top} e \\ &=(Y-X b)^{\top}(Y-X b) \\ &=Y^{\top} Y-Y^{\top} X b-b^{\top} X^{\top} Y+b^{\top} X^{\top} X b \\ \frac{d R S S}{d b} &=-2 X^{\top} Y+2 X^{\top} X b=0 \quad b=\left(X^{\top} X\right)^{-1} X^{\top} Y \end{aligned}$
+
+## Variance Covariance Matrix
+
+- Denoted $\sigma^2\{b\}$
+- Estimate  $\sigma^{2} \rightarrow s^{2}=M S E=\frac{\sum e_{i}^{2}}{n-2}$
+
+$\sigma^{2}\{b\}=\sigma^{2}\left(X^{\top} X\right)^{-1}$
+
+- Multicollinearity
+
+$\left(X^{\top} X\right)^{-1}$ close to singular
+
+Sensitive to small perturbation $\Rightarrow$ Unreliable parameter estimates
+
+## Geometrical Representation
+
+![img geom](/home/uscheed/Downloads/diag.png)
+
+$\begin{aligned} M =I-X\left(X^{\top} X\right)^{-1} X^{\top} \\ e =M Y=Y+\hat{Y}=Y+X b \hat{Y}= HY=X b \\ H =X\left(X^{\top} X\right)^{-1} X^{\top} \Rightarrow & \hat{Y} \perp e \end{aligned}$
+
+## Spectral Decomposition
+
+$A=\lambda_{1} u_{1} u_{1}^{\top}+\lambda_{2} u_{2} u_{2}^{\top}+ \dots+\lambda_{n} u_{n} u_{n}^{\top}$
+
+where A is a square symmetric matrix
+
+$A=P D P^{\top}$
+
+$P$ Orthonormal eigenvectors
+
+$D$ Diagonal matrix of eigenvalues
+
+## Principal Component Analysis
+
+- Reduce a large set of correlated predictor variables to a smaller uncorrelated set.
+- The principal component for a set of vectors are a set of linear combinations of the vectors chosen so that such set captures the most information in a smaller subset of vectors.
+
+## Procedure
+
+- Standardize $\frac{X-\mu}{\sigma}$
+
+- Find $X^{\top} X=P D P^{\top}=Z^{\top} Z$
+
+Singular Value Decomposition of X $\Rightarrow$ Truncated SVD 
+
+Maximize Rayleigh Coefficients
+
+$w_{1}=\operatorname{argmax}\left\{\frac{w^{\top} x^{\top} x w}{w^{\top} w}\right\}$
+
+$\begin{array}{l}{x_{k}=x-\sum_{s=1}^{k-1} x w_{s} w_{s}^{\top}} \\ {w_{k}=\operatorname{argmax}\left\{\frac{w^{\top} x_{k}^{\top} x_{k} w}{w^{\top} w}\right\}}\end{array}$
+
+## Procedure Continued
+
+- Step Two
+
+Fit Y on Z (OLS)
+
+- Step Three
+
+Choose components
+
+- Step Four 
+
+Transform back to x scale
+
+
+## RidgeReg Data
+
+\fontsize{7pt}{5}\selectfont
+```{r test1, echo=TRUE, warnings = FALSE}
+X1 <- 1:18; X2 <- c(2,4,6,7,7,7,8,10,12,13,13,13,14,16,18,19,19,19); X3 <- c(1,2,4,3,2,1,1,2,4,3,2,1,1,2,4,3,2,1); Y <- c(3,9,11,15,13,13,17,21,25,27,25,27,29,33,35,37,37,39)
+testdf <- data.frame(cbind(X1,X2,X3,Y)) 
+testmod <- lm(Y~., data = testdf)
+# vif(testmod)                            
+testpcr <- pcr(Y~., data = testdf, scale=TRUE, validation = "CV")
+cor(testdf)
+summary(testpcr)
+```
+
+## Iris Data
+
+\fontsize{7pt}{5}\selectfont
+```{r test2, warning=FALSE, echo=TRUE}
+irismod <- lm(Sepal.Length~., data = iris)
+# vif(irismod)
+cor(iris[1:4])
+irispcr <- pcr(Sepal.Length~., data = iris, scale = TRUE, validation = "CV")
+summary(irispcr)
+```
+
+## Formula One Racing Data: Description
+- Provides data from Formula One World Championships from 1950-2017 about constructors, lap times, race drivers, etc.
+- Given 13 .csv files to parse from.
+- We wanted to see which variables best captured the time spent on a circuit.
+- The columns used were circuit times, number of laps, number of pit stops, pit stop times, constructor points and driver points.
+
+## Verify Multicollinearity
+\fontsize{7pt}{5}\selectfont
+```{r multi, warning=FALSE, echo=TRUE}
+cor(hungres[,-c(1,2)])
+hungmod <- lm(milliseconds ~ laps + pitStops + MillisecondsPS + conPoints + drivPoints, 
+              data = hungres)
+# vif(hungmod)
+```
+
+
+## Principal Component Analysis
+\fontsize{7pt}{5}\selectfont
+```{r pca, warning=FALSE, echo=TRUE}
+hungmat <- as.matrix(hungres[,-c(1,2)])
+pca <- prcomp(hungmat, scale = TRUE, center = TRUE)
+summary(pca)
+```
+
+## Principal Component Regression
+\fontsize{4pt}{5}\selectfont
+::: columns
+:::: column
+```{r pcr, warning=FALSE, echo=TRUE}
+hungpcr <- pcr(milliseconds ~ laps + pitStops + MillisecondsPS + 
+                 conPoints + drivPoints, data = hungres, scale = TRUE, 
+                 validation = "CV")
+summary(hungpcr)
+coef(hungpcr, intercept = TRUE)
+```
+::::
+:::: column
+```{r pcr2, warning=FALSE, echo=TRUE}
+hungpcrlog <- pcr(log(milliseconds) ~ laps + pitStops + 
+                    log(MillisecondsPS) + conPoints + drivPoints, 
+                    data = hungres, scale = TRUE, validation = "CV")
+summary(hungpcrlog)
+coef(hungpcrlog, intercept = TRUE)
+```
+::::
+:::
+
+## Importance of Standardization
+\fontsize{4pt}{0}\selectfont
+::: columns
+:::: column
+```{r imp, warning=FALSE, echo=TRUE}
+noscale <- prcomp(hungres[,-c(1,2)], scale = FALSE)
+summary(noscale)
+biplot(noscale, scale = 0)
+```
+::::
+:::: column
+```{r imp2, warning=FALSE, echo=TRUE}
+scale <- prcomp(hungmat, scale = TRUE, center = TRUE)
+summary(scale)
+biplot(scale, scale = 0)
+```
+::::
+:::
+
+## Validation Plots
+\fontsize{7pt}{5}\selectfont
+
+::: columns
+:::: column
+```{r stand, warning=FALSE, echo=TRUE, fig.show='hold'}
+validationplot(hungpcr, main = "Root Mean Squared Error", scale = TRUE)
+```
+::::
+
+:::: column
+```{r stand2, warning=FALSE, echo=TRUE, fig.show='hold'}
+validationplot(hungpcr, val.type="MSEP", main = "Cross Validation MSE", scale = TRUE)
+```
+::::
+
+:::
+
+## Validation Plots (Log)
+\fontsize{7pt}{5}\selectfont
+
+::: columns
+:::: column
+```{r stand3, warning=FALSE, echo=TRUE, fig.show='hold'}
+validationplot(hungpcrlog, main = "Root Mean Squared Error (Log)", scale = TRUE)
+```
+::::
+
+:::: column
+```{r stand4, warning=FALSE, echo=TRUE, fig.show='hold'}
+validationplot(hungpcrlog, val.type="MSEP", main = "Cross Validation MSE (Log)", scale = TRUE)
+```
+::::
+
+:::
+
+## $R^2$ Plot
+```{r r2, warning=TRUE, echo=TRUE}
+validationplot(hungpcr, val.type = "R2", main = "R2")
+```
+
+## Prediction Plot
+```{r pred, warning=TRUE, echo=TRUE}
+predplot(hungpcr, main = "Prediction Plot")
+```
+
+## Prediction Plot (Log)
+```{r pred2, warning=TRUE, echo=TRUE}
+predplot(hungpcrlog, main = "Prediction Plot (Log)")
+```
+
+## Coefficient Plot
+```{r coeff, warning=TRUE, echo=TRUE}
+coefplot(hungpcr, main = "Coefficient Plot")
+```
+
+##Screeplot
+```{r scree, warning=TRUE, echo=TRUE}
+screeplot(pca, main = "Screeplot")
+```
+
+
+## References
+
+1. Michael H. Kutner, Christopher J. Nachtsheim, and John Neter. Applied Linear Regression Models. New York, NY: McGraw-Hill/Irwin, 2004.
+
+2. Johnston, R., Jones, K. & Manley, D. Qual Quant (2018) 52: 1957. https://doi.org/10.1007/s11135-017-0584-6
+
+3. https://www.whitman.edu/Documents/Academics/Mathematics/2017/Perez.pdf
+
+4. https://datascienceplus.com/multicollinearity-in-r/
+
+5. https://web.njit.edu/~wguo/Math644_2012/Math644_Chapter%201_part2.pdf
+
+6. https://ncss-wpengine.netdna-ssl.com/wp-content/themes/ncss/pdf/Procedures/NCSS/Principal_Components_Regression.pdf
+
+7. https://en.wikipedia.org/wiki/Principal_component_analysis
+
+## References Continued
+
+8. Dr. Christian Lucero, CMDA 4654 Lecture 08, Correlation and Least Squares, Lecture 14 MLR
+
+9. Volodymyr Kuleshov, Fast algorithms for sparse principal component analysis based on Rayleigh quotient iteration http://proceedings.mlr.press/v28/kuleshov13.pdf
+
+10. https://ncss-wpengine.netdna-ssl.com/wp-content/themes/ncss/pdf/Procedures/NCSS/Principal_Components_Regression.pdf
+
+11. https://www.r-bloggers.com/performing-principal-components-regression-pcr-in-r/
+
+
